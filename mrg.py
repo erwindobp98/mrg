@@ -163,7 +163,7 @@ DEFAULT_CONFIG = {
         "stagger_seconds": 3,
     },
     "initdata": {
-        "ttl_minutes": 50,
+        "ttl_minutes": 25,
     },
     "checkin_rewards": [5, 6, 7, 8, 9, 10, 15],
 }
@@ -603,169 +603,173 @@ class TurnstileSolver:
             log_info(self.account_id, "Turnstile slot didapat")
             return await self._solve_inner()
 
-async def _solve_inner(self) -> str | None:
-    try:
-        async_playwright = await self._load_playwright()
-    except RuntimeError as e:
-        log_error(self.account_id, "Load playwright gagal", e)
-        return None
-
-    profile_dir = BROWSER_PROFILES_DIR / f"{self.account_id}_mrg"
-    profile_dir.mkdir(parents=True, exist_ok=True)
-
-    captured = {"token": None}
-
-    async with async_playwright() as p:
+    async def _solve_inner(self) -> str | None:
         try:
-            context = await p.chromium.launch_persistent_context(
-                user_data_dir=str(profile_dir),
-                headless=TURNSTILE_HEADLESS,
-                args=get_launch_args(),
-            )
-        except Exception as e:
-            log_error(self.account_id, "Launch browser gagal", e)
+            async_playwright = await self._load_playwright()
+        except RuntimeError as e:
+            log_error(self.account_id, "Load playwright gagal", e)
             return None
 
-        page = await context.new_page()
+        profile_dir = BROWSER_PROFILES_DIR / f"{self.account_id}_mrg"
+        profile_dir.mkdir(parents=True, exist_ok=True)
 
-        if TURNSTILE_WINDOW_MODE == "minimize" and not TURNSTILE_HEADLESS:
-            await asyncio.sleep(1.5)
-            minimize_windows_browser("mrg")
-            minimize_windows_browser("chromium")
+        captured = {"token": None}
 
-        # Intercept request ke API MRG
-        async def on_request(request):
-            if captured["token"]:
-                return
+        async with async_playwright() as p:
             try:
-                if "mrg.up.railway.app" not in request.url:
+                context = await p.chromium.launch_persistent_context(
+                    user_data_dir=str(profile_dir),
+                    headless=TURNSTILE_HEADLESS,
+                    args=get_launch_args(),
+                )
+            except Exception as e:
+                log_error(self.account_id, "Launch browser gagal", e)
+                return None
+
+            page = await context.new_page()
+
+            # Handle minimize
+            if TURNSTILE_WINDOW_MODE == "minimize" and not TURNSTILE_HEADLESS:
+                await asyncio.sleep(1.5)
+                minimize_windows_browser("mrg")
+                minimize_windows_browser("chromium")
+
+            # ===== on_request DI DALAM async with =====
+            async def on_request(request):
+                if captured["token"]:
                     return
-                headers = request.headers
-                ts_token = headers.get("x-turnstile-token") or \
-                           headers.get("X-Turnstile-Token")
-                if ts_token and len(ts_token) > 100:
-                    captured["token"] = ts_token
-                    log_info(self.account_id, "Turnstile dari header")
+                try:
+                    if "mrg.up.railway.app" not in request.url:
+                        return
+                    headers = request.headers
+                    ts_token = headers.get("x-turnstile-token") or \
+                               headers.get("X-Turnstile-Token")
+                    if ts_token and len(ts_token) > 100:
+                        captured["token"] = ts_token
+                        log_info(self.account_id, "Turnstile dari header")
+                except Exception:
+                    pass
+
+            page.on("request", lambda r: asyncio.create_task(on_request(r)))
+
+            webapp_url = (
+                f"{APP_URL.rstrip('/')}/"
+                f"#tgWebAppData={quote(self.init_data, safe='')}"
+                f"&tgWebAppVersion=7.0&tgWebAppPlatform=android"
+            )
+
+            try:
+                await page.goto(webapp_url, wait_until="domcontentloaded",
+                                timeout=30000)
+            except Exception as e:
+                log_warn(self.account_id, f"Goto gagal: {e}")
+
+            if TURNSTILE_WINDOW_MODE == "minimize" and not TURNSTILE_HEADLESS:
+                await asyncio.sleep(1)
+                minimize_windows_browser("app.mrgtoken.xyz")
+                minimize_windows_browser("mrg")
+                minimize_windows_browser("chromium")
+
+            # FASE 1: Tunggu widget Turnstile
+            widget_found = False
+            start = time.time()
+            while time.time() - start < 20:
+                try:
+                    iframe = await page.query_selector(
+                        'iframe[src*="challenges.cloudflare.com"]'
+                    )
+                    if iframe:
+                        widget_found = True
+                        log_info(self.account_id, "Turnstile widget terdeteksi")
+                        break
+
+                    has_input = await page.evaluate("""
+                        () => !!document.querySelector('[name="cf-turnstile-response"]')
+                    """)
+                    if has_input:
+                        widget_found = True
+                        log_info(self.account_id, "Turnstile input terdeteksi")
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
+
+            if not widget_found:
+                log_warn(self.account_id, "Turnstile widget tidak muncul")
+
+            # FASE 2: Tunggu token & interaksi
+            start = time.time()
+            click_attempts = 0
+            while time.time() - start < TURNSTILE_TIMEOUT:
+                if captured["token"]:
+                    break
+
+                token = await self._try_capture_token(page)
+                if token:
+                    captured["token"] = token
+                    log_info(self.account_id, "Token didapat!")
+                    break
+
+                try:
+                    iframe = await page.query_selector(
+                        'iframe[src*="challenges.cloudflare.com"]'
+                    )
+                    if iframe:
+                        box = await iframe.bounding_box()
+                        if box and box["width"] > 0:
+                            click_x = box["x"] + 30
+                            click_y = box["y"] + box["height"] / 2
+
+                            click_attempts += 1
+                            log_info(self.account_id,
+                                     f"Klik Turnstile #{click_attempts} "
+                                     f"@ ({click_x:.0f}, {click_y:.0f})")
+
+                            await page.mouse.click(click_x, click_y)
+                            await asyncio.sleep(2)
+                except Exception as e:
+                    log_warn(self.account_id, f"Klik gagal: {e}")
+
+                await asyncio.sleep(1)
+
+            # FASE 3: Coba ambil token terakhir
+            if not captured["token"]:
+                token = await self._try_capture_token(page)
+                if token:
+                    captured["token"] = token
+
+            # Log debug kalau tidak dapat token
+            if not captured["token"]:
+                try:
+                    debug_info = await page.evaluate("""
+                        () => {
+                            const info = {};
+                            info.title = document.title || '';
+                            info.turnstileIframes = document.querySelectorAll(
+                                'iframe[src*="challenges.cloudflare.com"]'
+                            ).length;
+                            info.hasCfInput = !!document.querySelector(
+                                '[name="cf-turnstile-response"]'
+                            );
+                            info.hasTurnstileObject = !!window.turnstile;
+                            info.url = window.location.href.slice(0, 100);
+                            info.bodyPreview = (document.body.innerText || '')
+                                .slice(0, 80).replace(/\\n/g, ' ');
+                            return info;
+                        }
+                    """)
+                    log_info(self.account_id,
+                             f"Debug: {json.dumps(debug_info, ensure_ascii=False)}")
+                except Exception as e:
+                    log_warn(self.account_id, f"Debug info gagal: {e}")
+
+            # ===== Tutup context DI DALAM async with =====
+            try:
+                await context.close()
             except Exception:
                 pass
 
-        page.on("request", lambda r: asyncio.create_task(on_request(r)))
-
-        webapp_url = (
-            f"{APP_URL.rstrip('/')}/"
-            f"#tgWebAppData={quote(self.init_data, safe='')}"
-            f"&tgWebAppVersion=7.0&tgWebAppPlatform=android"
-        )
-
-        try:
-            await page.goto(webapp_url, wait_until="domcontentloaded",
-                            timeout=30000)
-        except Exception as e:
-            log_warn(self.account_id, f"Goto gagal: {e}")
-
-        if TURNSTILE_WINDOW_MODE == "minimize" and not TURNSTILE_HEADLESS:
-            await asyncio.sleep(1)
-            minimize_windows_browser("app.mrgtoken.xyz")
-            minimize_windows_browser("mrg")
-            minimize_windows_browser("chromium")
-
-        # FASE 1: Tunggu widget Turnstile muncul
-        widget_found = False
-        start = time.time()
-        while time.time() - start < 20:
-            try:
-                iframe = await page.query_selector(
-                    'iframe[src*="challenges.cloudflare.com"]'
-                )
-                if iframe:
-                    widget_found = True
-                    log_info(self.account_id, "Turnstile widget terdeteksi")
-                    break
-
-                has_input = await page.evaluate("""
-                    () => !!document.querySelector('[name="cf-turnstile-response"]')
-                """)
-                if has_input:
-                    widget_found = True
-                    log_info(self.account_id, "Turnstile input terdeteksi")
-                    break
-            except Exception:
-                pass
-            await asyncio.sleep(1)
-
-        if not widget_found:
-            log_warn(self.account_id, "Turnstile widget tidak muncul di halaman")
-
-        # FASE 2: Tunggu token & coba interaksi
-        start = time.time()
-        click_attempts = 0
-        while time.time() - start < TURNSTILE_TIMEOUT:
-            if captured["token"]:
-                break
-
-            token = await self._try_capture_token(page)
-            if token:
-                captured["token"] = token
-                log_info(self.account_id, "Token didapat!")
-                break
-
-            try:
-                iframe = await page.query_selector(
-                    'iframe[src*="challenges.cloudflare.com"]'
-                )
-                if iframe:
-                    box = await iframe.bounding_box()
-                    if box and box["width"] > 0:
-                        click_x = box["x"] + 30
-                        click_y = box["y"] + box["height"] / 2
-
-                        click_attempts += 1
-                        log_info(self.account_id,
-                                 f"Klik Turnstile #{click_attempts} "
-                                 f"@ ({click_x:.0f}, {click_y:.0f})")
-
-                        await page.mouse.click(click_x, click_y)
-                        await asyncio.sleep(2)
-            except Exception as e:
-                log_warn(self.account_id, f"Klik gagal: {e}")
-
-            await asyncio.sleep(1)
-
-        # FASE 3: Coba ambil token terakhir
-        if not captured["token"]:
-            token = await self._try_capture_token(page)
-            if token:
-                captured["token"] = token
-
-        # ✅ Log text (bukan screenshot) — hemat memory
-        if not captured["token"]:
-            try:
-                debug_info = await page.evaluate("""
-                    () => {
-                        const info = {};
-                        info.title = document.title || '';
-                        info.turnstileIframes = document.querySelectorAll(
-                            'iframe[src*="challenges.cloudflare.com"]'
-                        ).length;
-                        info.hasCfInput = !!document.querySelector(
-                            '[name="cf-turnstile-response"]'
-                        );
-                        info.hasTurnstileObject = !!window.turnstile;
-                        info.url = window.location.href.slice(0, 100);
-                        info.bodyPreview = (document.body.innerText || '')
-                            .slice(0, 80).replace(/\\n/g, ' ');
-                        return info;
-                    }
-                """)
-                log_info(self.account_id,
-                         f"Debug: {json.dumps(debug_info, ensure_ascii=False)}")
-            except Exception as e:
-                log_warn(self.account_id, f"Debug info gagal: {e}")
-
-        try:
-            await context.close()
-        except Exception:
-            pass
+        # async with selesai di sini
 
         if captured["token"]:
             log_info(self.account_id, "Turnstile token didapat")
@@ -774,79 +778,79 @@ async def _solve_inner(self) -> str | None:
         log_warn(self.account_id, "Turnstile token tidak dapat")
         return None
 
-async def _try_capture_token(self, page) -> str | None:
-    """Coba ambil token dari berbagai sumber."""
-    # Metode 1: input cf-turnstile-response
-    try:
-        token = await page.evaluate("""
-            () => {
-                const el = document.querySelector('[name="cf-turnstile-response"]');
-                return el ? el.value : null;
-            }
-        """)
-        if token and len(token) > 100:
-            return token
-    except Exception:
-        pass
+    async def _try_capture_token(self, page) -> str | None:
+        """Coba ambil token dari berbagai sumber."""
+        # Metode 1: input cf-turnstile-response
+        try:
+            token = await page.evaluate("""
+                () => {
+                    const el = document.querySelector('[name="cf-turnstile-response"]');
+                    return el ? el.value : null;
+                }
+            """)
+            if token and len(token) > 100:
+                return token
+        except Exception:
+            pass
 
-    # Metode 2: window.turnstile.getResponse()
-    try:
-        token = await page.evaluate("""
-            () => {
-                if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
-                    try {
-                        return window.turnstile.getResponse();
-                    } catch (e) {
-                        return null;
+        # Metode 2: window.turnstile.getResponse()
+        try:
+            token = await page.evaluate("""
+                () => {
+                    if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
+                        try {
+                            return window.turnstile.getResponse();
+                        } catch (e) {
+                            return null;
+                        }
                     }
+                    return null;
                 }
-                return null;
-            }
-        """)
-        if token and len(token) > 100:
-            return token
-    except Exception:
-        pass
+            """)
+            if token and len(token) > 100:
+                return token
+        except Exception:
+            pass
 
-    # Metode 3: iframe data-response
-    try:
-        token = await page.evaluate("""
-            () => {
-                const iframes = document.querySelectorAll(
-                    'iframe[src*="challenges.cloudflare.com"]'
-                );
-                for (const iframe of iframes) {
-                    const response = iframe.getAttribute('data-response');
-                    if (response && response.length > 100) return response;
-                }
-                return null;
-            }
-        """)
-        if token:
-            return token
-    except Exception:
-        pass
-
-    # Metode 4: input hidden dengan nama turnstile
-    try:
-        token = await page.evaluate("""
-            () => {
-                const inputs = document.querySelectorAll('input[type="hidden"]');
-                for (const inp of inputs) {
-                    if (inp.value && inp.value.length > 100 &&
-                        inp.name && inp.name.toLowerCase().includes('turnstile')) {
-                        return inp.value;
+        # Metode 3: iframe data-response
+        try:
+            token = await page.evaluate("""
+                () => {
+                    const iframes = document.querySelectorAll(
+                        'iframe[src*="challenges.cloudflare.com"]'
+                    );
+                    for (const iframe of iframes) {
+                        const response = iframe.getAttribute('data-response');
+                        if (response && response.length > 100) return response;
                     }
+                    return null;
                 }
-                return null;
-            }
-        """)
-        if token:
-            return token
-    except Exception:
-        pass
+            """)
+            if token:
+                return token
+        except Exception:
+            pass
 
-    return None
+        # Metode 4: input hidden
+        try:
+            token = await page.evaluate("""
+                () => {
+                    const inputs = document.querySelectorAll('input[type="hidden"]');
+                    for (const inp of inputs) {
+                        if (inp.value && inp.value.length > 100 &&
+                            inp.name && inp.name.toLowerCase().includes('turnstile')) {
+                            return inp.value;
+                        }
+                    }
+                    return null;
+                }
+            """)
+            if token:
+                return token
+        except Exception:
+            pass
+
+        return None
 
 
 # =====================================================================
@@ -1603,6 +1607,12 @@ class MRGClient:
                     earliest = reset_at
         return int(earliest / 1000) if earliest else 0
 
+    def _is_telegram_url(self, url: str) -> bool:
+        """Cek apakah URL adalah link Telegram (t.me / telegram.me)."""
+        if not url:
+            return False
+        return "t.me/" in url or "telegram.me/" in url
+
     async def _complete_task(self, task: dict, state: AccountState):
         title = task.get("title", "?")
         reward = task.get("reward", 0)
@@ -1613,9 +1623,12 @@ class MRGClient:
 
         if not self._is_hold_task(task):
             url = self._get_task_url(task)
-            if url and self.tg:
+
+            # Hanya join kalau URL Telegram
+            if url and self.tg and self._is_telegram_url(url):
                 await self._join_telegram_link(url)
 
+            # Dwell untuk semua task non-hold (Twitter/YouTube/Telegram)
             await activity(self.account_id, "TASK", "DWELL",
                            f"{title[:30]} | wait {TASK_DWELL_SECONDS}s")
             await asyncio.sleep(TASK_DWELL_SECONDS)
